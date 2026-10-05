@@ -29,6 +29,48 @@
   `failed` 并记录明确原因，后续帧全部忽略，状态与原因保持稳定；
 - 连续载荷（从 0 起无空洞的部分）滚动计算 SHA-256 与字节数。
 
+## 检查点计划
+
+`POST /api/channels/{id}/checkpoint-plan` 为信道登记一份可信检查点计划，用于发现
+单帧 CRC 无法识别的整体串换（每一段的累计字节数/SHA-256 均由任务侧独立给出）：
+
+```json
+{
+  "checkpoints": [
+    {"sequence": 9,  "contiguousBytes": 1500, "sha256": "…小写 hex…"},
+    {"sequence": 19, "contiguousBytes": 3100, "sha256": "…小写 hex…"}
+  ]
+}
+```
+
+- 含 1–4 项检查点，各项 `sequence`（末帧序号）严格递增，`sha256` 为 64 位小写 hex；
+- 仅**已存在**（至少收到过一帧）且未 failed 的信道可登记：未知信道 `404`，
+  非法 id/正文 `400`；
+- 首项 `sequence` 不得早于登记时的 `nextSequence`：若入流已消费过该末帧
+  （`nextSequence > sequence`），整份拒绝（`409`）且不保存任何内容；
+- 每信道只接受一份计划。同内容重试幂等返回各项当前状态（`replayed: true`）；
+  异内容返回 `409`，原计划不受影响；
+- 登记与 TCP 入流在同一把锁内原子裁决。组装跨过边界（消费完序号 `sequence` 的帧）
+  时，**只**核对截至该序号的累计字节数与 SHA-256；已暂存的更高序号帧不会混入；
+- 任一检查点不符，信道**永久** `failed`，后续帧不得改变状态。查询稳定给出失败的
+  检查点序号及期望/实际结果（见下）；此前已 `verified` 与之后仍 `pending` 的
+  检查点状态同样保持稳定。
+
+响应示例：
+
+```json
+{
+  "replayed": false,
+  "checkpoints": [
+    {"sequence": 9,  "contiguousBytes": 1500, "sha256": "…", "state": "verified"},
+    {"sequence": 19, "contiguousBytes": 3100, "sha256": "…", "state": "pending"}
+  ]
+}
+```
+
+`state` 为 `pending` / `verified` / `failed`；`failed` 项额外带
+`actualContiguousBytes` 与 `actualSha256`。
+
 ## HTTP API
 
 `GET /api/channels/{id}`（`id` 为 0–255 的整数）：
@@ -41,11 +83,13 @@
   "seenSequences": [0, 1, 2],
   "contiguousBytes": 7156,
   "sha256": "…hex…",
-  "failReason": "…"          // 仅 failed 时存在
+  "failReason": "…",         // 仅 failed 时存在
+  "checkpoints": [ … ]       // 仅登记过检查点计划时存在
 }
 ```
 
 - 未知信道：`404`；非法 id：`400`；
+- 未登记计划时响应字段与旧版完全一致（无 `checkpoints` 字段）；
 - `GET /healthz`：健康检查，恒 `200`。
 
 ## 配置
@@ -69,14 +113,20 @@ echo $?   # 0 表示全部通过
 docker compose down
 ```
 
-`verify` 的冒烟场景（每轮从当前空闲信道中随机选取 3 个测试信道 + 1 个 404 探测信道，
+`verify` 的冒烟场景（每轮从当前空闲信道中随机选取测试信道 + 1 个 404 探测信道，
 因此对同一网关实例可重复运行）：
 
 1. 48 帧经三条并发连接送达——逐字节写入、与垃圾/坏 CRC/非法长度帧粘连、乱序、
    同载荷重传——最终摘要必须与本地独立计算的 SHA-256 完全一致；
 2. 同序号不同载荷的冲突帧使信道永久 `failed`，且多次查询原因稳定；
 3. 越窗序号使信道永久 `failed`；
-4. 未知信道返回 404。
+4. 四项检查点的计划在乱序跨越多个检查点（含提前暂存于窗口边缘的帧）时逐项
+   `verified`，并覆盖 404、幂等重试与异内容 409；
+5. 检查点不符使信道永久 `failed`，失败检查点的序号与期望/实际结果稳定，
+   后续帧不改变状态；
+6. 首项边界已被入流越过的计划整份拒绝（409），边界恰为当前 `nextSequence`
+   时仍可登记并在末帧到达后核对；
+7. 未知信道返回 404。
 
 ## 本地开发
 

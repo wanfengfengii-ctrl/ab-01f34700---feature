@@ -29,13 +29,39 @@ const (
 )
 
 type channelStatus struct {
-	Channel         uint8    `json:"channel"`
-	Status          string   `json:"status"`
-	NextSequence    uint32   `json:"nextSequence"`
-	SeenSequences   []uint32 `json:"seenSequences"`
-	ContiguousBytes uint64   `json:"contiguousBytes"`
-	SHA256          string   `json:"sha256"`
-	FailReason      string   `json:"failReason"`
+	Channel         uint8      `json:"channel"`
+	Status          string     `json:"status"`
+	NextSequence    uint32     `json:"nextSequence"`
+	SeenSequences   []uint32   `json:"seenSequences"`
+	ContiguousBytes uint64     `json:"contiguousBytes"`
+	SHA256          string     `json:"sha256"`
+	FailReason      string     `json:"failReason"`
+	Checkpoints     []cpStatus `json:"checkpoints"`
+}
+
+type cpStatus struct {
+	Sequence              uint32 `json:"sequence"`
+	ContiguousBytes       int64  `json:"contiguousBytes"`
+	SHA256                string `json:"sha256"`
+	State                 string `json:"state"`
+	ActualContiguousBytes int64  `json:"actualContiguousBytes"`
+	ActualSHA256          string `json:"actualSha256"`
+}
+
+type checkpoint struct {
+	Sequence        uint32 `json:"sequence"`
+	ContiguousBytes int64  `json:"contiguousBytes"`
+	SHA256          string `json:"sha256"`
+}
+
+type planRequest struct {
+	Checkpoints []checkpoint `json:"checkpoints"`
+}
+
+type planResponse struct {
+	Replayed    bool       `json:"replayed"`
+	Checkpoints []cpStatus `json:"checkpoints"`
+	Error       string     `json:"error"`
 }
 
 func env(key, def string) string {
@@ -124,6 +150,12 @@ func senderByteByByte(addr string, ch uint8, seqs ...int) error {
 // senderGarbage glues garbage, a CRC-corrupt frame and two illegal-length
 // candidates in front of valid out-of-order frames 10..19, all in one write.
 func senderGarbage(addr string, ch uint8) error {
+	return senderGarbageRange(addr, ch, 10, 19)
+}
+
+// senderGarbageRange is senderGarbage generalized to any contiguous range;
+// the valid frames are emitted in a fixed permuted order.
+func senderGarbageRange(addr string, ch uint8, lo, hi int) error {
 	c, err := dial(addr)
 	if err != nil {
 		return err
@@ -144,7 +176,7 @@ func senderGarbage(addr string, ch uint8) error {
 	b.Write([]byte{0, 0, 0, 89}) // seq 89
 	b.Write([]byte{0x07, 0xD0})  // length 2000 > 1024: illegal
 	b.Write([]byte{0x01, 0x02, 0x03})
-	for _, s := range []int{15, 10, 19, 12, 17, 11, 14, 18, 13, 16} {
+	for s := hi; s >= lo; s-- {
 		b.Write(frameBytes(ch, uint32(s), payloadFor(s)))
 	}
 	_, err = c.Write(b.Bytes())
@@ -160,12 +192,28 @@ func senderChunked(addr string, ch uint8) error {
 	}
 	defer c.Close()
 	var b bytes.Buffer
-	for s := 20; s <= 31; s++ {
-		b.Write(frameBytes(ch, uint32(s), payloadFor(s)))
-	}
+	b.Write(rangeFrames(ch, 20, 31))
 	b.Write(frameBytes(ch, 5, payloadFor(5)))
 	b.Write(frameBytes(ch, 25, payloadFor(25)))
 	return writeChunks(c, b.Bytes(), func(off int) int { return 1 + (off*11)%64 })
+}
+
+// senderChunkedRange writes frames lo..hi in irregular chunk sizes.
+func senderChunkedRange(addr string, ch uint8, lo, hi int) error {
+	c, err := dial(addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return writeChunks(c, rangeFrames(ch, lo, hi), func(off int) int { return 1 + (off*11)%64 })
+}
+
+func rangeFrames(ch uint8, lo, hi int) []byte {
+	var b bytes.Buffer
+	for s := lo; s <= hi; s++ {
+		b.Write(frameBytes(ch, uint32(s), payloadFor(s)))
+	}
+	return b.Bytes()
 }
 
 func getStatus(base string, id int) (channelStatus, int, error) {
@@ -218,27 +266,87 @@ func waitForFailed(base string, ch int) error {
 	})
 }
 
-// pickChannels finds four currently-unknown channels: three to exercise
-// (happy path, conflict, window overflow) and one that must stay unknown
-// for the 404 check. This keeps verify re-runnable against a long-lived
-// gateway that still holds state from previous runs.
-func pickChannels(base string) (happy, conflict, window, unknown uint8, err error) {
+func waitForChannelExists(base string, ch int) error {
+	return waitFor(fmt.Sprintf("channel %d exists", ch), func() (bool, error) {
+		_, code, err := getStatus(base, ch)
+		return code == http.StatusOK, err
+	})
+}
+
+// cumulativeDigest independently computes the contiguous byte count and
+// SHA-256 over payloads 0..upTo in sequence order.
+func cumulativeDigest(upTo int) (int64, string) {
+	h := sha256.New()
+	var n int64
+	for i := 0; i <= upTo; i++ {
+		p := payloadFor(i)
+		h.Write(p)
+		n += int64(len(p))
+	}
+	return n, hex.EncodeToString(h.Sum(nil))
+}
+
+func planCheckpoints(ups ...int) []checkpoint {
+	cps := make([]checkpoint, len(ups))
+	for i, up := range ups {
+		n, sum := cumulativeDigest(up)
+		cps[i] = checkpoint{Sequence: uint32(up), ContiguousBytes: n, SHA256: sum}
+	}
+	return cps
+}
+
+func postPlan(base string, ch int, cps []checkpoint) (planResponse, int, error) {
+	var res planResponse
+	b, err := json.Marshal(planRequest{Checkpoints: cps})
+	if err != nil {
+		return res, 0, err
+	}
+	resp, err := http.Post(fmt.Sprintf("%s/api/channels/%d/checkpoint-plan", base, ch),
+		"application/json", bytes.NewReader(b))
+	if err != nil {
+		return res, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return res, resp.StatusCode, err
+	}
+	if resp.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(body, &res); err != nil {
+			return res, resp.StatusCode, fmt.Errorf("decode plan response: %w", err)
+		}
+	} else {
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(body, &e)
+		res.Error = e.Error
+	}
+	return res, resp.StatusCode, nil
+}
+
+// pickChannels finds seven currently-unknown channels: five to exercise
+// (happy path, conflict, window overflow, checkpoints, checkpoint mismatch,
+// late checkpoint) and one that must stay unknown for the 404 check. This
+// keeps verify re-runnable against a long-lived gateway that still holds
+// state from previous runs.
+func pickChannels(base string) (happy, conflict, window, cpOK, cpBad, cpLate, unknown uint8, err error) {
 	off := rand.New(rand.NewSource(time.Now().UnixNano())).Intn(256)
 	var free []uint8
-	for i := 0; i < 256 && len(free) < 4; i++ {
+	for i := 0; i < 256 && len(free) < 7; i++ {
 		id := uint8((off + i) % 256)
 		_, code, e := getStatus(base, int(id))
 		if e != nil {
-			return 0, 0, 0, 0, fmt.Errorf("probe channel %d: %w", id, e)
+			return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("probe channel %d: %w", id, e)
 		}
 		if code == http.StatusNotFound {
 			free = append(free, id)
 		}
 	}
-	if len(free) < 4 {
-		return 0, 0, 0, 0, fmt.Errorf("need 4 unused channels, found %d", len(free))
+	if len(free) < 7 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("need 7 unused channels, found %d", len(free))
 	}
-	return free[0], free[1], free[2], free[3], nil
+	return free[0], free[1], free[2], free[3], free[4], free[5], free[6], nil
 }
 
 // happyPath delivers frames 0..47 of channel ch across concurrent
@@ -405,6 +513,254 @@ func unknownChannel(httpBase string, id uint8) error {
 	return nil
 }
 
+// checkpointPlanHappy registers a four-checkpoint plan against a live
+// channel and drives 0..47 across concurrent, fragmented, out-of-order
+// connections (one frame buffered far ahead before registration), asserting
+// every checkpoint verifies on its own boundary and plan replay/conflict
+// semantics.
+func checkpointPlanHappy(tcpAddr, httpBase string, ch uint8) error {
+	// Registration is only allowed for an existing channel: 404 first.
+	if _, code, err := postPlan(httpBase, int(ch), planCheckpoints(9)); err != nil || code != http.StatusNotFound {
+		return fmt.Errorf("plan on unknown channel: code=%d err=%v, want 404", code, err)
+	}
+	// Buffer frame 31 before registering (exactly at the window edge with
+	// nextSequence=0): it stays pending while the earlier boundaries are
+	// checked and must never leak into cumulative results before its own
+	// boundary.
+	c, err := dial(tcpAddr)
+	if err != nil {
+		return err
+	}
+	if _, err := c.Write(frameBytes(ch, 31, payloadFor(31))); err != nil {
+		c.Close()
+		return err
+	}
+	c.Close()
+	if err := waitForChannelExists(httpBase, int(ch)); err != nil {
+		return err
+	}
+
+	cps := planCheckpoints(9, 19, 31, 47)
+	res, code, err := postPlan(httpBase, int(ch), cps)
+	if err != nil || code != http.StatusOK {
+		return fmt.Errorf("register plan: code=%d err=%v %+v", code, err, res)
+	}
+	for i, cs := range res.Checkpoints {
+		if cs.State != "pending" || cs.Sequence != cps[i].Sequence {
+			return fmt.Errorf("fresh plan checkpoint %d: %+v, want pending", i, cs)
+		}
+	}
+
+	// Out-of-order delivery crossing the first three boundaries on three
+	// connections; frame 47 is already buffered.
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	run := func(f func() error) {
+		defer wg.Done()
+		if err := f(); err != nil {
+			errs <- err
+		}
+	}
+	rev := func(lo, hi int) []int {
+		var out []int
+		for s := hi; s >= lo; s-- {
+			out = append(out, s)
+		}
+		return out
+	}
+	wg.Add(3)
+	go run(func() error { return senderByteByByte(tcpAddr, ch, rev(0, 9)...) })
+	go run(func() error { return senderGarbageRange(tcpAddr, ch, 10, 19) })
+	go run(func() error { return senderChunkedRange(tcpAddr, ch, 20, 31) })
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		if e != nil {
+			return fmt.Errorf("sender: %w", e)
+		}
+	}
+	if err := waitForSequence(httpBase, int(ch), 32); err != nil {
+		return err
+	}
+	// Fill 32..47 reversed; 47 is buffered until the end and the final
+	// boundary is only checked once it drains.
+	if err := senderByteByByte(tcpAddr, ch, rev(32, 47)...); err != nil {
+		return err
+	}
+	if err := waitForSequence(httpBase, int(ch), totalFrames); err != nil {
+		return err
+	}
+
+	st, _, err := getStatus(httpBase, int(ch))
+	if err != nil {
+		return err
+	}
+	if st.Status != "ok" {
+		return fmt.Errorf("status=%q failReason=%q, want ok", st.Status, st.FailReason)
+	}
+	if len(st.Checkpoints) != 4 {
+		return fmt.Errorf("checkpoints in status: %+v, want 4", st.Checkpoints)
+	}
+	for i, cs := range st.Checkpoints {
+		if cs.Sequence != cps[i].Sequence || cs.State != "verified" {
+			return fmt.Errorf("checkpoint %d: %+v, want verified at seq %d", i, cs, cps[i].Sequence)
+		}
+	}
+	// Identical retry returns current states; a different plan is a 409.
+	res2, code, err := postPlan(httpBase, int(ch), cps)
+	if err != nil || code != http.StatusOK || !res2.Replayed {
+		return fmt.Errorf("identical replay: code=%d err=%v replayed=%v", code, err, res2.Replayed)
+	}
+	for _, cs := range res2.Checkpoints {
+		if cs.State != "verified" {
+			return fmt.Errorf("replayed checkpoint %d state=%s", cs.Sequence, cs.State)
+		}
+	}
+	different := planCheckpoints(9, 19, 31, 46)
+	if _, code, err := postPlan(httpBase, int(ch), different); err != nil || code != http.StatusConflict {
+		return fmt.Errorf("different plan: code=%d err=%v, want 409", code, err)
+	}
+	return nil
+}
+
+// checkpointMismatch registers a plan whose first checkpoint cannot match,
+// drives the boundary frame over TCP and requires a permanent, stable
+// failure naming the checkpoint and expected/actual results.
+func checkpointMismatch(tcpAddr, httpBase string, ch uint8) error {
+	// Bring the channel into existence with a buffered-ahead frame (next=0).
+	if err := func() error {
+		c, err := dial(tcpAddr)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		_, err = c.Write(frameBytes(ch, 3, payloadFor(3)))
+		return err
+	}(); err != nil {
+		return err
+	}
+	if err := waitForChannelExists(httpBase, int(ch)); err != nil {
+		return err
+	}
+	bad := checkpoint{Sequence: 0, ContiguousBytes: 999, SHA256: strings.Repeat("0", 64)}
+	if res, code, err := postPlan(httpBase, int(ch), []checkpoint{bad, planCheckpoints(3)[0]}); err != nil || code != http.StatusOK {
+		return fmt.Errorf("register plan: code=%d err=%v %+v", code, err, res)
+	}
+	c, err := dial(tcpAddr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if _, err := c.Write(frameBytes(ch, 0, payloadFor(0))); err != nil {
+		return err
+	}
+	if err := waitForFailed(httpBase, int(ch)); err != nil {
+		return err
+	}
+	expectBytes, expectSum := cumulativeDigest(0)
+	checkSt := func() error {
+		st, code, err := getStatus(httpBase, int(ch))
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK || st.Status != "failed" {
+			return fmt.Errorf("code=%d status=%q", code, st.Status)
+		}
+		if len(st.Checkpoints) != 2 || st.Checkpoints[0].State != "failed" ||
+			st.Checkpoints[0].Sequence != 0 {
+			return fmt.Errorf("checkpoint detail: %+v", st.Checkpoints)
+		}
+		fc := st.Checkpoints[0]
+		if fc.ContiguousBytes != 999 || fc.SHA256 != strings.Repeat("0", 64) ||
+			fc.ActualContiguousBytes != expectBytes || fc.ActualSHA256 != expectSum {
+			return fmt.Errorf("expected/actual detail: %+v", fc)
+		}
+		if !strings.Contains(st.FailReason, "checkpoint") || !strings.Contains(st.FailReason, "0") {
+			return fmt.Errorf("failReason=%q", st.FailReason)
+		}
+		if st.NextSequence != 1 {
+			return fmt.Errorf("nextSequence=%d, want 1 (frozen)", st.NextSequence)
+		}
+		return nil
+	}
+	if err := checkSt(); err != nil {
+		return err
+	}
+	// More frames must not change the state.
+	if _, err := c.Write(frameBytes(ch, 1, payloadFor(1))); err != nil {
+		return err
+	}
+	if _, err := c.Write(frameBytes(ch, 2, payloadFor(2))); err != nil {
+		return err
+	}
+	time.Sleep(500 * time.Millisecond)
+	if err := checkSt(); err != nil {
+		return fmt.Errorf("after more frames: %w", err)
+	}
+	// An identical plan retry still returns the current (failed) states; a
+	// different plan is rejected.
+	res, code, err := postPlan(httpBase, int(ch), []checkpoint{bad, planCheckpoints(3)[0]})
+	if err != nil || code != http.StatusOK || !res.Replayed ||
+		len(res.Checkpoints) != 2 || res.Checkpoints[0].State != "failed" ||
+		res.Checkpoints[1].State != "pending" {
+		return fmt.Errorf("replay on failed channel: code=%d err=%v %+v", code, err, res)
+	}
+	if _, code, err := postPlan(httpBase, int(ch), planCheckpoints(0)); err != nil || code != http.StatusConflict {
+		return fmt.Errorf("different plan on failed channel: code=%d err=%v, want 409", code, err)
+	}
+	return nil
+}
+
+// checkpointLate races the plan against inflow: once the first boundary is
+// consumed the whole plan is refused (409), but a plan starting at the exact
+// current nextSequence is still accepted and then verified.
+func checkpointLate(tcpAddr, httpBase string, ch uint8) error {
+	c, err := dial(tcpAddr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	for s := 0; s <= 3; s++ {
+		if _, err := c.Write(frameBytes(ch, uint32(s), payloadFor(s))); err != nil {
+			return err
+		}
+	}
+	if err := waitForSequence(httpBase, int(ch), 4); err != nil {
+		return err
+	}
+	// Boundary seq 2 has already been consumed: whole plan rejected.
+	if _, code, err := postPlan(httpBase, int(ch), planCheckpoints(2, 5)); err != nil || code != http.StatusConflict {
+		return fmt.Errorf("late plan: code=%d err=%v, want 409", code, err)
+	}
+	// And nothing was stored.
+	st, _, err := getStatus(httpBase, int(ch))
+	if err != nil {
+		return err
+	}
+	if len(st.Checkpoints) != 0 {
+		return fmt.Errorf("rejected plan was stored: %+v", st.Checkpoints)
+	}
+	// Boundary exactly at nextSequence (4) is still registerable.
+	cps := planCheckpoints(4)
+	if res, code, err := postPlan(httpBase, int(ch), cps); err != nil || code != http.StatusOK {
+		return fmt.Errorf("boundary==next plan: code=%d err=%v %+v", code, err, res)
+	}
+	if _, err := c.Write(frameBytes(ch, 4, payloadFor(4))); err != nil {
+		return err
+	}
+	if err := waitForSequence(httpBase, int(ch), 5); err != nil {
+		return err
+	}
+	st, _, err = getStatus(httpBase, int(ch))
+	if err != nil {
+		return err
+	}
+	if st.Status != "ok" || len(st.Checkpoints) != 1 || st.Checkpoints[0].State != "verified" {
+		return fmt.Errorf("boundary checkpoint not verified: %+v status=%q", st.Checkpoints, st.Status)
+	}
+	return nil
+}
+
 func waitHealthy(httpBase string) error {
 	return waitFor("app health", func() (bool, error) {
 		resp, err := http.Get(httpBase + "/healthz")
@@ -425,13 +781,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
 		os.Exit(1)
 	}
-	happy, conflict, window, unknown, err := pickChannels(httpBase)
+	happy, conflict, window, cpOK, cpBad, cpLate, unknown, err := pickChannels(httpBase)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("smoke channels: happy=%d conflict=%d window=%d unknown=%d\n",
-		happy, conflict, window, unknown)
+	fmt.Printf("smoke channels: happy=%d conflict=%d window=%d checkpointOK=%d checkpointBad=%d checkpointLate=%d unknown=%d\n",
+		happy, conflict, window, cpOK, cpBad, cpLate, unknown)
 
 	steps := []struct {
 		name string
@@ -441,6 +797,15 @@ func main() {
 		{"reordered/glued/byte-split frames yield identical digest", func() error { return happyPath(tcpAddr, httpBase, happy) }},
 		{"content conflict fails channel with stable reason", func() error { return conflictPath(tcpAddr, httpBase, conflict) }},
 		{"window overflow fails channel", func() error { return windowPath(tcpAddr, httpBase, window) }},
+		{"checkpoint plan verifies across reordered multi-boundary inflow", func() error {
+			return checkpointPlanHappy(tcpAddr, httpBase, cpOK)
+		}},
+		{"checkpoint mismatch fails channel with stable expected/actual", func() error {
+			return checkpointMismatch(tcpAddr, httpBase, cpBad)
+		}},
+		{"checkpoint plan after a crossed boundary is refused", func() error {
+			return checkpointLate(tcpAddr, httpBase, cpLate)
+		}},
 	}
 	for _, s := range steps {
 		fmt.Printf("[smoke] %-58s ", s.name)
