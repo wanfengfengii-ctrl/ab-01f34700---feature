@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -87,7 +88,67 @@ func (s *Server) HTTPHandler() http.Handler {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET /api/channels/{id}", s.handleChannelStatus)
+	mux.HandleFunc("POST /api/channels/{id}/checkpoint-plan", s.handleCheckpointPlan)
 	return mux
+}
+
+// checkpointPlanRequest is the POST body for checkpoint-plan registration.
+type checkpointPlanRequest struct {
+	Checkpoints []Checkpoint `json:"checkpoints"`
+}
+
+// handleCheckpointPlan registers the channel's single checkpoint plan.
+//
+//   - unknown channel: 404 (registration never creates a channel);
+//   - malformed body or invalid checkpoints: 400;
+//   - failed channel, first boundary already crossed, or a different plan
+//     already registered: 409;
+//   - identical retry: 200 with each checkpoint's current state;
+//   - first registration: 201 with each checkpoint's current state.
+func (s *Server) handleCheckpointPlan(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 8)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid channel id: want integer 0-255")
+		return
+	}
+	c, ok := s.channel(uint8(id))
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown channel")
+		return
+	}
+	var req checkpointPlanRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, 64*1024))
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if reason := ValidateCheckpoints(req.Checkpoints); reason != "" {
+		writeError(w, http.StatusBadRequest, reason)
+		return
+	}
+	created, regErr := c.RegisterPlan(req.Checkpoints)
+	code := http.StatusOK
+	if created {
+		code = http.StatusCreated
+	}
+	switch {
+	case regErr == nil:
+	case errors.Is(regErr, ErrPlanConflict):
+		writeError(w, http.StatusConflict, regErr.Error())
+		return
+	case errors.Is(regErr, ErrBoundaryCrossed):
+		writeError(w, http.StatusConflict, regErr.Error())
+		return
+	case errors.Is(regErr, ErrChannelFailed):
+		writeError(w, http.StatusConflict, regErr.Error())
+		return
+	default:
+		writeError(w, http.StatusInternalServerError, "failed to register checkpoint plan")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(c.PlanStatus())
 }
 
 func (s *Server) handleChannelStatus(w http.ResponseWriter, r *http.Request) {
