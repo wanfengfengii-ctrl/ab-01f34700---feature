@@ -1,0 +1,36 @@
+name: telemetry-gateway
+
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: telemetry-gateway:local
+    environment:
+      # Container-side listen ports (also configurable).
+      HTTP_PORT: "${HTTP_PORT:-8080}"
+      TCP_PORT: "${TCP_PORT:-9000}"
+    ports:
+      # Host-side ports: override HTTP_HOST_PORT / TCP_HOST_PORT as needed.
+      - "${HTTP_HOST_PORT:-8080}:${HTTP_PORT:-8080}"
+      - "${TCP_HOST_PORT:-9000}:${TCP_PORT:-9000}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${HTTP_PORT:-8080}/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: telemetry-gateway-verify:local
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_TCP_ADDR: "app:${TCP_PORT:-9000}"
+      APP_HTTP_ADDR: "http://app:${HTTP_PORT:-8080}"
+    restart: "no"
